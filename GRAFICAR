@@ -1,0 +1,97 @@
+import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+
+def visualizar_sistema_potencia(sistema_8_barras_escalable):
+    print(f"Cargando topología desde {sistema_8_barras_escalable}...")
+    
+    # 1. Leer los datos
+    df_nodos = pd.read_excel(sistema_8_barras_escalable, sheet_name='Nodos')
+    df_lineas = pd.read_excel(sistema_8_barras_escalable, sheet_name='Lineas_Existentes')
+    df_corredores = pd.read_excel(sistema_8_barras_escalable, sheet_name='Corredores_Candidatos')
+    
+    # 2. Crear el grafo
+    G = nx.MultiGraph()
+    
+    # Agregar nodos con sus atributos de Generación y Demanda
+    for _, row in df_nodos.iterrows():
+        nodo = int(row['Nodo'])
+        pg = float(row['PG_MW'])
+        pl = float(row['PL_MW'])
+        
+        # Etiqueta personalizada para el nodo
+        etiqueta_nodo = f"Barra {nodo}\nPG: {pg:.0f} MW\nPL: {pl:.0f} MW"
+        
+        G.add_node(nodo, label=etiqueta_nodo)
+        
+    # Agregar líneas existentes con la distancia
+    for _, row in df_lineas.iterrows():
+        origen = int(row['Origen'])
+        destino = int(row['Destino'])
+        distancia = float(row['Distancia_millas'])
+        G.add_edge(origen, destino, tipo='existente', distancia=f"{distancia:.0f} km")
+        
+    # Agregar corredores candidatos con la distancia
+    for _, row in df_corredores.iterrows():
+        origen = int(row['Origen'])
+        destino = int(row['Destino'])
+        distancia = float(row['Distancia_millas'])
+        G.add_edge(origen, destino, tipo='candidato', distancia=f"{distancia:.0f} km")
+
+    # 3. Configurar la visualización
+    plt.figure(figsize=(14, 10)) # Lienzo más grande para acomodar el texto
+    
+    # Distribuir los nodos espacialmente
+    pos = nx.spring_layout(G, k=1.5, seed=42) # Aumentamos 'k' para separar más los nodos
+    
+    # --- DIBUJAR NODOS ---
+    nx.draw_networkx_nodes(G, pos, node_color='lightblue', node_size=1500, edgecolors='black')
+    
+    # Extraer las etiquetas personalizadas de los nodos
+    nombres_nodos = nx.get_node_attributes(G, 'label')
+    nx.draw_networkx_labels(G, pos, labels=nombres_nodos, font_size=12, font_weight='bold')
+    
+    # --- DIBUJAR LÍNEAS (ARISTAS) ---
+    aristas_existentes = [(u, v) for u, v, d in G.edges(data=True) if d.get('tipo') == 'existente']
+    aristas_candidatas = [(u, v) for u, v, d in G.edges(data=True) if d.get('tipo') == 'candidato']
+    
+    nx.draw_networkx_edges(G, pos, edgelist=aristas_existentes, width=2.0, edge_color='black')
+    nx.draw_networkx_edges(G, pos, edgelist=aristas_candidatas, width=2.0, edge_color='red', style='dashed')
+    
+    # --- DIBUJAR ETIQUETAS DE LAS LÍNEAS (DISTANCIA) ---
+    # Extraer las etiquetas de distancia (solo tomamos la primera en caso de aristas múltiples)
+    distancias = {}
+    for u, v, d in G.edges(data=True):
+        if (u, v) not in distancias and (v, u) not in distancias: 
+            distancias[(u, v)] = d.get('distancia', '')
+
+    nx.draw_networkx_edge_labels(
+        G, pos, 
+        edge_labels=distancias, 
+        font_color='darkgreen', 
+        font_size=9,
+        font_weight='bold',
+        bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=1) # Fondo blanco transparente para que se lea mejor
+    )
+    
+    # --- LEYENDA Y ESTILOS ---
+    import matplotlib.lines as mlines
+    linea_ex = mlines.Line2D([], [], color='black', linewidth=2, label='Línea Existente')
+    linea_cand = mlines.Line2D([], [], color='red', linewidth=2, linestyle='dashed', label='Corredor Candidato')
+    texto_dist = mlines.Line2D([], [], color='darkgreen', marker='$\mathregular{10 mi}$', linestyle='None', markersize=20, label='Distancia')
+    
+    plt.legend(handles=[linea_ex, linea_cand, texto_dist], loc='upper left', fontsize=11)
+    plt.title("Topología del Sistema de Transmisión\nGeneración, Demanda y Distancias", fontsize=16, fontweight='bold')
+    plt.axis('off') 
+    plt.tight_layout()
+    
+    # Mostrar el gráfico
+    plt.show()
+
+if __name__ == "__main__":
+    # Asegúrate de usar el archivo que contiene la columna 'Distancia_millas'
+    archivo = "sistema_8_barras_escalable.xlsx"
+    try:
+        visualizar_sistema_potencia(archivo)
+    except FileNotFoundError:
+        print(f"No se encontró el archivo '{archivo}'.")

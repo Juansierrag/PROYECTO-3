@@ -1,0 +1,144 @@
+import pandas as pd
+import gurobipy as gp
+from gurobipy import GRB
+
+def resolver_milp_escalable(sistema_8_barras_escalable):
+    print(f"Leyendo topología desde: {sistema_8_barras_escalable}...")
+    
+    # 1. CARGAR DATOS DESDE EXCEL
+    df_nodos = pd.read_excel(sistema_8_barras_escalable, sheet_name='Nodos')
+    df_lineas = pd.read_excel(sistema_8_barras_escalable, sheet_name='Lineas_Existentes')
+    df_corredores = pd.read_excel(sistema_8_barras_escalable, sheet_name='Corredores_Candidatos')
+    
+    # 2. INICIALIZAR EL MODELO
+    m = gp.Model("TNEP_MILP_Escalable")
+    m.Params.OutputFlag = 1
+
+    # 3. VARIABLES DE LOS NODOS (Ángulos)
+    theta = {}
+    inyeccion = {}
+    
+    for idx, row in df_nodos.iterrows():
+        n = int(row['Nodo'])
+        theta[n] = m.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"theta_{n}")
+        inyeccion[n] = row['Inyeccion_Neta_pu']
+        
+    m.update() # Refrescar modelo para aplicar variables
+    
+    # Configurar el nodo de referencia (ángulo = 0)
+    ref_node_row = df_nodos[df_nodos['es_referencia'] == 1]
+    if not ref_node_row.empty:
+        ref_node = int(ref_node_row['Nodo'].iloc[0])
+        m.addConstr(theta[ref_node] == 0, name="ref_angle")
+    else:
+        print("Advertencia: No se definió nodo de referencia. Forzando Nodo 1.")
+        m.addConstr(theta[1] == 0, name="ref_angle")
+
+    # 4. VARIABLES Y RESTRICCIONES DE CORREDORES CANDIDATOS (Big-M)
+    w = {}       # Variable binaria
+    dtheta = {}  # Diferencia angular auxiliar
+    f_cand = {}  # Flujo por el corredor candidato
+    
+    for idx, row in df_corredores.iterrows():
+        i = int(row['Origen'])
+        j = int(row['Destino'])
+        cost = row['Costo_Inversion']
+        n_max = int(row['N_Max'])
+        x = row['Reactancia_pu']
+        cap = row['Capacidad_pu']
+        
+        w_sum = 0
+        dtheta_sum = 0
+        
+        for k in range(1, n_max + 1):
+            w[i, j, k] = m.addVar(vtype=GRB.BINARY, name=f"w_{i}_{j}_{k}")
+            dtheta[i, j, k] = m.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"dtheta_{i}_{j}_{k}")
+            f_cand[i, j, k] = m.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"fcand_{i}_{j}_{k}")
+            
+            # Ecuación de flujo acoplada
+            m.addConstr(f_cand[i, j, k] == k * (1/x) * dtheta[i, j, k], name=f"flujo_{i}_{j}_{k}")
+            
+            # Límites de capacidad controlados por la variable binaria
+            m.addConstr(f_cand[i, j, k] <= k * cap * w[i, j, k], name=f"cap_max_{i}_{j}_{k}")
+            m.addConstr(f_cand[i, j, k] >= -k * cap * w[i, j, k], name=f"cap_min_{i}_{j}_{k}")
+            
+            w_sum += w[i, j, k]
+            dtheta_sum += dtheta[i, j, k]
+            
+        # Restricción de unicidad (solo se elige una opción constructiva)
+        m.addConstr(w_sum <= 1, name=f"unicidad_{i}_{j}")
+        
+        # Linealización Big-M (M = 1 radián)
+        m.addConstr(theta[i] - theta[j] - dtheta_sum >= w_sum - 1, name=f"bigM_lb_{i}_{j}")
+        m.addConstr(theta[i] - theta[j] - dtheta_sum <= 1 - w_sum, name=f"bigM_ub_{i}_{j}")
+
+    # 5. VARIABLES Y RESTRICCIONES DE LÍNEAS EXISTENTES
+    f_ex = {}
+    for idx, row in df_lineas.iterrows():
+        i = int(row['Origen'])
+        j = int(row['Destino'])
+        x = row['Reactancia_pu']
+        cap = row['Capacidad_pu']
+        
+        # Usamos el idx en la llave por si hay líneas paralelas idénticas existentes
+        f_ex[idx, i, j] = m.addVar(lb=-cap, ub=cap, name=f"fex_{i}_{j}_{idx}")
+        m.addConstr(f_ex[idx, i, j] == (1/x) * (theta[i] - theta[j]), name=f"kirchhoff_{i}_{j}_{idx}")
+
+    # 6. BALANCE NODAL (1ra Ley de Kirchhoff iterativa)
+    for n in inyeccion.keys():
+        # Flujos que salen del nodo 'n'
+        out_ex = gp.quicksum(f_ex[idx, i, j] for (idx, i, j) in f_ex.keys() if i == n)
+        out_cand = gp.quicksum(f_cand[i, j, k] for (i, j, k) in f_cand.keys() if i == n)
+        
+        # Flujos que entran al nodo 'n'
+        in_ex = gp.quicksum(f_ex[idx, i, j] for (idx, i, j) in f_ex.keys() if j == n)
+        in_cand = gp.quicksum(f_cand[i, j, k] for (i, j, k) in f_cand.keys() if j == n)
+        
+        # Balance global del nodo
+        m.addConstr((out_ex + out_cand) - (in_ex + in_cand) == inyeccion[n], name=f"balance_{n}")
+
+    # 7. FUNCIÓN OBJETIVO
+    # Minimizar el costo de las líneas candidatas activadas
+    obj = gp.quicksum(
+        k * df_corredores[(df_corredores['Origen']==i) & (df_corredores['Destino']==j)]['Costo_Inversion'].iloc[0] * w[i, j, k]
+        for (i, j, k) in w.keys()
+    )
+    m.setObjective(obj, GRB.MINIMIZE)
+
+    # 8. RESOLVER EL MODELO
+    m.optimize()
+
+    # 9. IMPRESIÓN DE RESULTADOS
+    if m.status == GRB.OPTIMAL:
+        print("\n" + "="*40)
+        print("🚀 SOLUCIÓN MILP ÓPTIMA ENCONTRADA")
+        print("="*40)
+        print(f"Costo Total de Inversión: {m.ObjVal} USD/pu\n")
+        
+        print("📍 NUEVAS LÍNEAS INSTALADAS:")
+        lineas_construidas = False
+        for (i, j, k) in w.keys():
+            if w[i, j, k].X > 0.5: # Si la variable binaria es 1
+                print(f"   ► Corredor {i} -> {j}: Construir {k} línea(s)")
+                lineas_construidas = True
+                
+        if not lineas_construidas:
+            print("   ► No se requiere construir nuevas líneas. La red existente soporta la demanda.")
+            
+        print("\n📐 ÁNGULOS DE BARRA (Radianes):")
+        for n in inyeccion.keys():
+            print(f"   Nodo {n}: {theta[n].X:.4f} rad")
+    else:
+        print("\n❌ EL MODELO ES INFACTIBLE.")
+        print("Posibles causas:")
+        print("1. La suma de las inyecciones netas (Generación - Demanda) no es exactamente cero.")
+        print("2. La red, incluso instalando todas las líneas máximas permitidas (N_Max), no puede satisfacer la demanda.")
+
+if __name__ == "__main__":
+    # Asegúrate de haber ejecutado el script generador de Excel primero
+    archivo = "sistema_8_barras_escalable.xlsx"
+    
+    try:
+        resolver_milp_escalable(archivo)
+    except FileNotFoundError:
+        print(f"No se encontró el archivo '{archivo}'. Asegúrate de correr el código que genera el Excel primero.")

@@ -1,0 +1,107 @@
+import gurobipy as gp
+from gurobipy import GRB
+
+def resolver_milp_garver_bigm():
+    # 1. PARÁMETROS DEL SISTEMA (Base 100 MVA)
+    # Nodos: 0=1, 1=2, 2=3, 3=4, 4=5, 5=6
+    net_injection = [-0.30, -2.40, 1.25, -1.60, -2.40, 5.45] 
+    
+    # Líneas existentes: (origen, destino, x_pu, cap_pu)
+    existing_lines = [
+        (0, 1, 0.4, 1.0),
+        (0, 3, 0.6, 0.8),
+        (0, 4, 0.2, 1.0),
+        (1, 2, 0.2, 1.0),
+        (1, 3, 0.4, 1.0),
+        (2, 4, 0.2, 1.0)
+    ]
+    
+    # Corredores candidatos: (origen, destino, costo_total, n_max, x_pu, cap_pu)
+    candidate_corridors = [
+        (5, 1, 150, 4, 0.30, 1.0),  # 6-2
+        (5, 3, 150, 4, 0.30, 1.0),  # 6-4
+        (5, 4, 305, 3, 0.61, 1.0),  # 6-5
+        (2, 4, 100, 3, 0.20, 1.0)   # 3-5
+    ]
+    
+    # 2. INICIALIZAR EL MODELO
+    m = gp.Model("Garver_MILP_BigM")
+    m.Params.OutputFlag = 1
+
+    # 3. VARIABLES DE DECISIÓN
+    # Ángulos de nodo en radianes
+    theta = m.addVars(6, lb=-GRB.INFINITY, ub=GRB.INFINITY, name="theta")
+    m.addConstr(theta[4] == 0, name="ref_angle") # El Nodo 5 (índice 4) es la referencia
+    
+    w = {}       # Variable binaria w_{i,j,k}
+    dtheta = {}  # Variable continua auxiliar \Delta\theta_{i,j,k}
+    f_cand = {}  # Flujo por el corredor P_{i,j,k}
+    
+    for i, j, cost, n_max, x, cap in candidate_corridors:
+        w_sum = 0
+        dtheta_sum = 0
+        for k in range(1, n_max + 1):
+            # 1 si se instalan exactamente 'k' líneas en el corredor i-j
+            w[i, j, k] = m.addVar(vtype=GRB.BINARY, name=f"w_{i+1}_{j+1}_{k}")
+            dtheta[i, j, k] = m.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"dtheta_{i+1}_{j+1}_{k}")
+            f_cand[i, j, k] = m.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"fcand_{i+1}_{j+1}_{k}")
+            
+            # El flujo depende linealmente del dtheta
+            m.addConstr(f_cand[i, j, k] == k * (1/x) * dtheta[i, j, k], name=f"flujo_{i+1}_{j+1}_{k}")
+            
+            # Límites de capacidad limitados por la variable binaria
+            m.addConstr(f_cand[i, j, k] <= k * cap * w[i, j, k], name=f"cap_max_{i+1}_{j+1}_{k}")
+            m.addConstr(f_cand[i, j, k] >= -k * cap * w[i, j, k], name=f"cap_min_{i+1}_{j+1}_{k}")
+            
+            w_sum += w[i, j, k]
+            dtheta_sum += dtheta[i, j, k]
+            
+        # Restricción de unicidad: máximo se escoge una opción (un valor de 'k') por corredor
+        m.addConstr(w_sum <= 1, name=f"unicidad_{i+1}_{j+1}")
+        
+        # Linealización Big-M (con M = 1 radián)
+        # Activa sum(dtheta) = theta_i - theta_j si sum(w) == 1, de lo contrario la banda se abre
+        m.addConstr(theta[i] - theta[j] - dtheta_sum >= w_sum - 1, name=f"bigM_lb_{i+1}_{j+1}")
+        m.addConstr(theta[i] - theta[j] - dtheta_sum <= 1 - w_sum, name=f"bigM_ub_{i+1}_{j+1}")
+
+    # Flujos por las líneas existentes
+    f_ex = {}
+    for i, j, x, cap in existing_lines:
+        f_ex[i, j] = m.addVar(lb=-cap, ub=cap, name=f"fex_{i+1}_{j+1}")
+        m.addConstr(f_ex[i, j] == (1/x) * (theta[i] - theta[j]), name=f"kirchhoff_{i+1}_{j+1}")
+        
+    # 4. BALANCE NODAL
+    for node in range(6):
+        out_ex = gp.quicksum(f_ex[i, j] for i, j, x, cap in existing_lines if i == node)
+        out_cand = gp.quicksum(f_cand[i, j, k] for i, j, cost, n_max, x, cap in candidate_corridors if i == node for k in range(1, n_max + 1))
+        
+        in_ex = gp.quicksum(f_ex[i, j] for i, j, x, cap in existing_lines if j == node)
+        in_cand = gp.quicksum(f_cand[i, j, k] for i, j, cost, n_max, x, cap in candidate_corridors if j == node for k in range(1, n_max + 1))
+        
+        m.addConstr((out_ex + out_cand) - (in_ex + in_cand) == net_injection[node], name=f"balance_{node+1}")
+        
+    # 5. FUNCIÓN OBJETIVO
+    # Costo base multiplicado por el 'k' correspondiente de la variable activa
+    obj = gp.quicksum(k * cost * w[i, j, k] for i, j, cost, n_max, x, cap in candidate_corridors for k in range(1, n_max + 1))
+    m.setObjective(obj, GRB.MINIMIZE)
+    
+    # 6. RESOLVER
+    m.optimize()
+    
+    # 7. IMPRIMIR RESULTADOS
+    if m.status == GRB.OPTIMAL:
+        print("\n--- SOLUCIÓN ÓPTIMA MILP ---")
+        print(f"Costo Total de Inversión: {m.ObjVal} USD/pu\n")
+        
+        for i, j, cost, n_max, x, cap in candidate_corridors:
+            lineas_inst = sum(k * w[i, j, k].X for k in range(1, n_max + 1))
+            print(f" Corredor {i+1}-{j+1}: {int(lineas_inst)} línea(s)")
+            
+        print("\nÁngulos de barra (Radianes):")
+        for node in range(6):
+            print(f" Nodo {node+1}: {theta[node].X:.4f} rad")
+    else:
+        print("No se encontró solución óptima.")
+
+if __name__ == "__main__":
+    resolver_milp_garver_bigm()

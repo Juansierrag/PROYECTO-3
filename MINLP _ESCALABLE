@@ -1,0 +1,123 @@
+import pandas as pd
+import gurobipy as gp
+from gurobipy import GRB
+
+def resolver_minlp_escalable(archivo_excel):
+    print(f"Leyendo topología desde: {archivo_excel}...")
+    
+    # 1. CARGAR DATOS DESDE EXCEL
+    df_nodos = pd.read_excel(archivo_excel, sheet_name='Nodos')
+    df_lineas = pd.read_excel(archivo_excel, sheet_name='Lineas_Existentes')
+    df_corredores = pd.read_excel(archivo_excel, sheet_name='Corredores_Candidatos')
+    
+    # 2. INICIALIZAR EL MODELO
+    m = gp.Model("TNEP_MINLP_Escalable")
+    
+    # ¡CRÍTICO! Permite resolver el producto de variable entera (n_ij) por continua (theta)
+    m.Params.NonConvex = 2 
+    m.Params.OutputFlag = 1
+
+    # 3. VARIABLES DE LOS NODOS (Ángulos)
+    theta = {}
+    inyeccion = {}
+    
+    for idx, row in df_nodos.iterrows():
+        n = int(row['Nodo'])
+        theta[n] = m.addVar(lb=-GRB.INFINITY, ub=GRB.INFINITY, name=f"theta_{n}")
+        inyeccion[n] = row['Inyeccion_Neta_pu']
+        
+    # Nodo de referencia (ángulo = 0)
+    ref_node_row = df_nodos[df_nodos['es_referencia'] == 1]
+    ref_node = int(ref_node_row['Nodo'].iloc[0]) if not ref_node_row.empty else int(df_nodos['Nodo'].iloc[0])
+    m.addConstr(theta[ref_node] == 0, name="ref_angle")
+
+    # 4. VARIABLES Y RESTRICCIONES DE CORREDORES CANDIDATOS (No Lineal)
+    n_var = {}   # Variable entera: número de líneas a construir
+    f_cand = {}  # Variable continua: flujo por el corredor
+    candidates_data = {}
+    
+    for idx, row in df_corredores.iterrows():
+        i = int(row['Origen'])
+        j = int(row['Destino'])
+        cost = row['Costo_Inversion']
+        n_max = int(row['N_Max'])
+        x = row['Reactancia_pu']
+        cap = row['Capacidad_pu']
+        
+        candidates_data[(i, j)] = cost
+        
+        # Variable entera n_ij
+        n_var[i, j] = m.addVar(vtype=GRB.INTEGER, lb=0, ub=n_max, name=f"n_{i}_{j}")
+        
+        # Flujo continuo f_cand con límites conservadores máximos absolutos
+        f_cand[i, j] = m.addVar(lb=-n_max*cap, ub=n_max*cap, name=f"fcand_{i}_{j}")
+        
+        # ECUACIÓN BILINEAL DIRECTA: P = n * B * \Delta\theta
+        m.addConstr(f_cand[i, j] == n_var[i, j] * (1/x) * (theta[i] - theta[j]), name=f"flujo_{i}_{j}")
+        
+        # Límite de capacidad dinámico dependiendo de cuántas líneas se instalen
+        m.addConstr(f_cand[i, j] <= n_var[i, j] * cap, name=f"cap_max_{i}_{j}")
+        m.addConstr(f_cand[i, j] >= -n_var[i, j] * cap, name=f"cap_min_{i}_{j}")
+
+    # 5. VARIABLES Y RESTRICCIONES DE LÍNEAS EXISTENTES
+    f_ex = {}
+    existing_lines = []
+    for idx, row in df_lineas.iterrows():
+        i = int(row['Origen'])
+        j = int(row['Destino'])
+        x = row['Reactancia_pu']
+        cap = row['Capacidad_pu']
+        existing_lines.append((idx, i, j))
+        
+        f_ex[idx] = m.addVar(lb=-cap, ub=cap, name=f"fex_{idx}_{i}_{j}")
+        m.addConstr(f_ex[idx] == (1/x) * (theta[i] - theta[j]), name=f"kirchhoff_ex_{idx}")
+
+    # 6. BALANCE NODAL (1ra Ley de Kirchhoff)
+    for n in inyeccion.keys():
+        out_ex = gp.quicksum(f_ex[idx] for (idx, i, j) in existing_lines if i == n)
+        in_ex = gp.quicksum(f_ex[idx] for (idx, i, j) in existing_lines if j == n)
+        
+        out_cand = gp.quicksum(f_cand[i, j] for (i, j) in n_var.keys() if i == n)
+        in_cand = gp.quicksum(f_cand[i, j] for (i, j) in n_var.keys() if j == n)
+        
+        m.addConstr((out_ex + out_cand) - (in_ex + in_cand) == inyeccion[n], name=f"balance_{n}")
+
+    # 7. FUNCIÓN OBJETIVO
+    # Minimizar el costo: sumatoria de (costo_ij * n_ij)
+    obj = gp.quicksum(candidates_data[(i, j)] * n_var[i, j] for (i, j) in n_var.keys())
+    m.setObjective(obj, GRB.MINIMIZE)
+
+    # 8. RESOLVER
+    m.optimize()
+
+    # 9. RESULTADOS
+    if m.status == GRB.OPTIMAL:
+        print("\n" + "="*40)
+        print(" 🚀 SOLUCIÓN ÓPTIMA MINLP ENCONTRADA")
+        print("="*40)
+        print(f"Costo Total de Inversión: {m.ObjVal:.2f} pu\n")
+        
+        print("📍 NUEVAS LÍNEAS INSTALADAS:")
+        lineas_construidas = False
+        for (i, j) in n_var.keys():
+            num_lineas = int(round(n_var[i, j].X))
+            if num_lineas > 0:
+                print(f"   ► Corredor {i} -> {j}: Construir {num_lineas} línea(s)")
+                lineas_construidas = True
+                
+        if not lineas_construidas:
+            print("   ► No se requiere construir nuevas líneas.")
+            
+        print("\n📐 ÁNGULOS DE BARRA (Radianes):")
+        for n in inyeccion.keys():
+            print(f"   Nodo {n}: {theta[n].X:.4f} rad")
+    else:
+        print("\n❌ EL MODELO ES INFACTIBLE.")
+
+if __name__ == "__main__":
+    # Sustituye por el nombre de tu archivo exacto
+    archivo = "sistema_8_barras_escalable.xlsx"
+    try:
+        resolver_minlp_escalable(archivo)
+    except FileNotFoundError:
+        print(f"No se encontró el archivo '{archivo}'.")
